@@ -1514,6 +1514,17 @@ impl RequestForwarder {
         // suffix and add the context-1m beta header.
         let mut codex_anthropic_one_m = false;
 
+        // Capture the client-side reasoning intent before a generic protocol
+        // converter can collapse a tiered control into a plain on/off switch.
+        // The intent is only consumed when the final outbound model is exactly
+        // GLM-5.3 on a direct Zhipu gateway.
+        let glm_5_3_reasoning_intent =
+            if super::providers::glm_reasoning::is_direct_zhipu_gateway(&base_url) {
+                super::providers::glm_reasoning::capture_glm_5_3_reasoning_intent(&mapped_body)
+            } else {
+                None
+            };
+
         // 转换请求体（如果需要）
         let mut request_body = if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
@@ -1621,6 +1632,17 @@ impl RequestForwarder {
             mapped_body
         };
 
+        if super::providers::glm_reasoning::normalize_direct_zhipu_glm_5_3_request(
+            &base_url,
+            &mut request_body,
+            glm_5_3_reasoning_intent,
+        ) {
+            log::debug!(
+                "[GLM-5.3] Normalized reasoning controls for direct Zhipu upstream (provider={})",
+                provider.id
+            );
+        }
+
         // Native Responses passthrough to a strict third-party gateway (xAI):
         // flatten Codex's private `namespace`/plugin tool declarations into
         // top-level function tools so the upstream's strict serde parser does
@@ -1680,6 +1702,20 @@ impl RequestForwarder {
                     filtered_body = prepare_upstream_request_body(filtered_body);
                 }
             }
+        }
+        // Overrides are intentionally applied before this final capability
+        // guard: even an explicit body override cannot ask a thinking-only
+        // GLM-5.3 endpoint to disable reasoning. No original-intent fallback is
+        // used here, so a valid override tier remains authoritative.
+        if super::providers::glm_reasoning::normalize_direct_zhipu_glm_5_3_request(
+            &base_url,
+            &mut filtered_body,
+            None,
+        ) {
+            log::debug!(
+                "[GLM-5.3] Normalized overridden reasoning controls for direct Zhipu upstream (provider={})",
+                provider.id
+            );
         }
         // 出站 body 定稿后刷新真值（覆盖 Codex chat 上游模型覆写、转换层模型改写）
         if let Some(m) = filtered_body

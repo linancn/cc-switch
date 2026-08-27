@@ -3518,6 +3518,13 @@ fn prepare_final_upstream_request_body(
     // Model is an allowed local body override, so the final capability guard
     // must run after overrides rather than mutating an intermediate model.
     let mut filtered_body = prepare_upstream_request_body(request_body);
+    let final_override_body = if is_copilot {
+        None
+    } else {
+        overrides
+            .and_then(|overrides| overrides.body.as_ref())
+            .filter(|body| body.is_object())
+    };
     if !is_copilot {
         if let Some(overrides) = overrides {
             if apply_local_proxy_body_overrides(&mut filtered_body, overrides) {
@@ -3526,11 +3533,20 @@ fn prepare_final_upstream_request_body(
         }
     }
 
-    let normalized = super::providers::glm_reasoning::normalize_direct_zhipu_glm_5_3_request(
-        base_url,
-        &mut filtered_body,
-        glm_5_3_reasoning_intent,
-    );
+    let normalized = if let Some(final_override_body) = final_override_body {
+        super::providers::glm_reasoning::normalize_direct_zhipu_glm_5_3_request_with_override(
+            base_url,
+            &mut filtered_body,
+            glm_5_3_reasoning_intent,
+            Some(final_override_body),
+        )
+    } else {
+        super::providers::glm_reasoning::normalize_direct_zhipu_glm_5_3_request(
+            base_url,
+            &mut filtered_body,
+            glm_5_3_reasoning_intent,
+        )
+    };
     if normalized {
         // Keep the same deterministic ordering guarantee after the normalizer
         // inserts or removes fields from the final body.
@@ -4071,6 +4087,33 @@ mod tests {
         assert_eq!(body["model"], "glm-5.3-flash");
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
         assert_eq!(body["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn final_glm_effort_override_wins_over_stale_disabled_toggle() {
+        let request_body = json!({
+            "model": "glm-5.3-flash",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "thinking": { "type": "disabled" }
+        });
+        let intent =
+            crate::proxy::providers::glm_reasoning::capture_glm_5_3_reasoning_intent(&request_body);
+        let overrides = LocalProxyRequestOverrides {
+            headers: HashMap::new(),
+            body: Some(json!({ "reasoning_effort": "max" })),
+        };
+
+        let (body, normalized) = prepare_final_upstream_request_body(
+            request_body,
+            Some(&overrides),
+            false,
+            "https://open.bigmodel.cn/api/anthropic",
+            intent,
+        );
+
+        assert!(normalized);
+        assert_eq!(body["thinking"], json!({ "type": "enabled" }));
+        assert_eq!(body["reasoning_effort"], "max");
     }
 
     #[test]

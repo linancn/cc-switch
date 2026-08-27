@@ -147,6 +147,25 @@ pub(crate) fn capture_glm_5_3_reasoning_intent(body: &Value) -> Option<Glm53Reas
     }
 }
 
+fn capture_glm_5_3_override_intent(body: &Value) -> Option<Glm53ReasoningIntent> {
+    // An override object may contain neighboring fields such as
+    // `reasoning.summary` or `thinking.clear_thinking` without overriding the
+    // reasoning tier. Only the actual control fields establish a new intent.
+    let has_explicit_control = body.pointer("/thinking/type").is_some()
+        || body.get("reasoning_effort").is_some()
+        || body.pointer("/reasoning/effort").is_some()
+        || body.get("reasoning").is_some_and(Value::is_null)
+        || body.pointer("/output_config/effort").is_some();
+    if !has_explicit_control {
+        return None;
+    }
+
+    // Preserve the ordinary capture precedence when the override itself
+    // contains conflicting controls. A present but malformed control remains
+    // authoritative as intent-without-tier so the illegal value is removed.
+    Some(capture_glm_5_3_reasoning_intent(body).unwrap_or_else(|| Glm53ReasoningIntent::new(None)))
+}
+
 fn merge_intent(
     outbound: Option<Glm53ReasoningIntent>,
     original: Option<Glm53ReasoningIntent>,
@@ -266,6 +285,18 @@ pub(crate) fn normalize_direct_zhipu_glm_5_3_request(
     body: &mut Value,
     original_intent: Option<Glm53ReasoningIntent>,
 ) -> bool {
+    normalize_direct_zhipu_glm_5_3_request_with_override(base_url, body, original_intent, None)
+}
+
+/// Normalize with an optional local body-override layer. Explicit reasoning
+/// controls in that layer outrank both the merged final body and the original
+/// pre-conversion intent, regardless of which stale sibling fields remain.
+pub(crate) fn normalize_direct_zhipu_glm_5_3_request_with_override(
+    base_url: &str,
+    body: &mut Value,
+    original_intent: Option<Glm53ReasoningIntent>,
+    final_override_body: Option<&Value>,
+) -> bool {
     if !is_direct_zhipu_gateway(base_url)
         || !body
             .get("model")
@@ -275,7 +306,9 @@ pub(crate) fn normalize_direct_zhipu_glm_5_3_request(
         return false;
     }
 
-    let Some(intent) = merge_intent(capture_glm_5_3_reasoning_intent(body), original_intent) else {
+    let override_intent = final_override_body.and_then(capture_glm_5_3_override_intent);
+    let merged_intent = merge_intent(capture_glm_5_3_reasoning_intent(body), original_intent);
+    let Some(intent) = override_intent.or(merged_intent) else {
         // No client reasoning control: preserve the upstream-enabled default
         // and its provider-selected effort rather than inventing a tier.
         return false;
@@ -390,6 +423,69 @@ mod tests {
         );
         assert_eq!(body["reasoning_effort"], "low");
         assert_eq!(body["output_config"], json!({ "verbosity": "low" }));
+    }
+
+    #[test]
+    fn final_override_layer_resolves_stale_control_conflicts_symmetrically() {
+        for sibling_only in [
+            json!({ "thinking": { "clear_thinking": false } }),
+            json!({ "reasoning": { "summary": "auto" } }),
+        ] {
+            assert_eq!(capture_glm_5_3_override_intent(&sibling_only), None);
+        }
+        assert_eq!(
+            capture_glm_5_3_override_intent(&json!({ "reasoning_effort": null })),
+            Some(Glm53ReasoningIntent::new(None))
+        );
+
+        for (override_body, expected_effort) in [
+            (json!({ "reasoning_effort": "max" }), "max"),
+            (json!({ "thinking": { "type": "disabled" } }), "low"),
+        ] {
+            // The merged body is deliberately identical in both cases. The
+            // explicit override layer determines which of the stale siblings
+            // is authoritative.
+            let mut body = json!({
+                "model": "glm-5.3-flash",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "thinking": { "type": "disabled", "clear_thinking": false },
+                "reasoning_effort": "max"
+            });
+
+            assert!(normalize_direct_zhipu_glm_5_3_request_with_override(
+                "https://open.bigmodel.cn/api/anthropic",
+                &mut body,
+                None,
+                Some(&override_body),
+            ));
+            assert_eq!(
+                body["thinking"],
+                json!({ "type": "enabled", "clear_thinking": false })
+            );
+            assert_eq!(body["reasoning_effort"], expected_effort);
+        }
+
+        for (override_body, expected_effort) in [
+            (json!({ "reasoning": { "effort": "max" } }), "max"),
+            (json!({ "thinking": { "type": "disabled" } }), "low"),
+        ] {
+            let mut body = json!({
+                "model": "glm-5.3-flash",
+                "input": "hi",
+                "thinking": { "type": "disabled" },
+                "reasoning": { "effort": "max", "summary": "auto" }
+            });
+
+            assert!(normalize_direct_zhipu_glm_5_3_request_with_override(
+                "https://api.z.ai/api/v1",
+                &mut body,
+                None,
+                Some(&override_body),
+            ));
+            assert!(body.get("thinking").is_none());
+            assert_eq!(body["reasoning"]["effort"], expected_effort);
+            assert_eq!(body["reasoning"]["summary"], "auto");
+        }
     }
 
     #[test]

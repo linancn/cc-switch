@@ -1,13 +1,14 @@
 //! GLM reasoning capability normalization.
 //!
-//! GLM-5.3 is a thinking-only model. Zhipu's API accepts only
-//! `thinking.type = "enabled"` and the `low | high | max` effort domain.
+//! GLM-5.3 and GLM-5.3-Flash are thinking-only models. Zhipu's API accepts
+//! only `thinking.type = "enabled"` and the `low | high | max` effort domain.
 //! Claude/Codex clients expose wider, provider-neutral controls, so direct
 //! Zhipu routes need a model-scoped semantic translation before forwarding.
 //!
 //! Vendor references:
 //! - <https://z.ai/blog/glm-5.3>
 //! - <https://docs.z.ai/api-reference/llm/chat-completion>
+//! - <https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash>
 //!
 //! The same `enabled + reasoning_effort` shape is accepted by Zhipu's
 //! Anthropic-compatible endpoint (verified against the direct endpoint).
@@ -15,6 +16,8 @@
 use crate::claude_desktop_config::ONE_M_CONTEXT_MARKER;
 use serde_json::{json, Value};
 use url::Url;
+
+const THINKING_ONLY_GLM_5_3_MODEL_TAILS: &[&str] = &["glm-5.3", "glm-5.3-flash"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Glm53Effort {
@@ -46,10 +49,11 @@ impl Glm53ReasoningIntent {
     }
 }
 
-/// Exact GLM-5.3 detection after the model-name forms CC Switch accepts are
-/// normalized. Deliberately fail open for unverified variants such as 5.30 or
-/// 5.3v instead of inheriting capabilities by prefix.
-pub(crate) fn is_glm_5_3_model(model: &str) -> bool {
+/// Exact GLM-5.3 forced-thinking-family detection after the model-name forms
+/// CC Switch accepts are normalized. Deliberately fail open for unverified
+/// variants such as 5.30, 5.3v, or flashx instead of inheriting capabilities
+/// by prefix.
+pub(crate) fn is_thinking_only_glm_5_3_family_model(model: &str) -> bool {
     let mut normalized = model.trim().to_ascii_lowercase();
     if normalized
         .as_bytes()
@@ -60,7 +64,10 @@ pub(crate) fn is_glm_5_3_model(model: &str) -> bool {
         normalized = normalized.trim_end().to_string();
     }
     let normalized = normalized.strip_prefix("models/").unwrap_or(&normalized);
-    normalized.rsplit('/').next() == Some("glm-5.3")
+    normalized
+        .rsplit('/')
+        .next()
+        .is_some_and(|tail| THINKING_ONLY_GLM_5_3_MODEL_TAILS.contains(&tail))
 }
 
 /// Only Zhipu's own endpoints are known to use the `thinking` plus top-level
@@ -101,7 +108,7 @@ fn budget_to_effort(budget: u64) -> Glm53Effort {
 /// Capture reasoning intent from either Anthropic/Chat-shaped or
 /// Responses-shaped input. `Some(intent-without-tier)` records an explicit but
 /// unknown/on-with-default control so an illegal field can be removed without
-/// inventing a tier; absence remains `None` and preserves GLM-5.3's max default.
+/// inventing a tier; absence remains `None` and preserves the upstream default.
 pub(crate) fn capture_glm_5_3_reasoning_intent(body: &Value) -> Option<Glm53ReasoningIntent> {
     let thinking_type = body
         .pointer("/thinking/type")
@@ -250,7 +257,7 @@ fn apply_responses_intent(body: &mut Value, intent: Glm53ReasoningIntent) -> boo
     changed
 }
 
-/// Normalize the final outbound request for a direct Zhipu GLM-5.3 route.
+/// Normalize the final outbound request for a direct Zhipu GLM-5.3-family route.
 ///
 /// `original_intent` is captured before protocol conversion. It restores tier
 /// information that an on/off-only generic converter may otherwise discard.
@@ -263,13 +270,14 @@ pub(crate) fn normalize_direct_zhipu_glm_5_3_request(
         || !body
             .get("model")
             .and_then(Value::as_str)
-            .is_some_and(is_glm_5_3_model)
+            .is_some_and(is_thinking_only_glm_5_3_family_model)
     {
         return false;
     }
 
     let Some(intent) = merge_intent(capture_glm_5_3_reasoning_intent(body), original_intent) else {
-        // No client reasoning control: preserve the documented enabled+max default.
+        // No client reasoning control: preserve the upstream-enabled default
+        // and its provider-selected effort rather than inventing a tier.
         return false;
     };
 
@@ -302,11 +310,22 @@ mod tests {
             "glm-5.3[1M]",
             "zhipu/glm-5.3",
             "models/zai-org/GLM-5.3[1m]",
+            "glm-5.3-flash",
+            "GLM-5.3-FLASH[1M]",
+            "zhipu/glm-5.3-flash",
+            "models/zai-org/GLM-5.3-Flash[1m]",
         ] {
-            assert!(is_glm_5_3_model(model), "{model}");
+            assert!(is_thinking_only_glm_5_3_family_model(model), "{model}");
         }
-        for model in ["glm-5.2", "glm-5.30", "glm-5.3v", "glm-5.3-air"] {
-            assert!(!is_glm_5_3_model(model), "{model}");
+        for model in [
+            "glm-5.2",
+            "glm-5.30",
+            "glm-5.3v",
+            "glm-5.3-air",
+            "glm-5.3-flashx",
+            "glm-5.3-flash-vision",
+        ] {
+            assert!(!is_thinking_only_glm_5_3_family_model(model), "{model}");
         }
     }
 
@@ -350,7 +369,7 @@ mod tests {
     #[test]
     fn messages_disabled_becomes_enabled_low_and_preserves_siblings() {
         let mut body = json!({
-            "model": "glm-5.3",
+            "model": "glm-5.3-flash",
             "messages": [{ "role": "user", "content": "hi" }],
             "thinking": {
                 "type": "disabled",
@@ -419,7 +438,7 @@ mod tests {
         });
         let intent = capture_glm_5_3_reasoning_intent(&original);
         let mut converted = json!({
-            "model": "glm-5.3",
+            "model": "glm-5.3-flash",
             "messages": [{ "role": "user", "content": "hi" }],
             "thinking": { "type": "enabled" }
         });
@@ -456,7 +475,7 @@ mod tests {
     #[test]
     fn responses_none_becomes_low_and_preserves_reasoning_siblings() {
         let mut body = json!({
-            "model": "glm-5.3",
+            "model": "glm-5.3-flash",
             "input": "hi",
             "reasoning": { "effort": "none", "summary": "auto" }
         });
@@ -567,10 +586,12 @@ mod tests {
     fn absent_controls_and_neighboring_models_remain_byte_identical() {
         let cases = [
             json!({ "model": "glm-5.3", "messages": [{ "role": "user", "content": "hi" }] }),
+            json!({ "model": "glm-5.3-flash", "messages": [{ "role": "user", "content": "hi" }] }),
             json!({ "model": "glm-5.2", "messages": [], "thinking": { "type": "disabled" } }),
             json!({ "model": "glm-5.3", "messages": [], "thinking": { "type": "disabled" } }),
         ];
         let urls = [
+            "https://api.z.ai/api/anthropic",
             "https://api.z.ai/api/anthropic",
             "https://api.z.ai/api/anthropic",
             "https://openrouter.ai/api/v1",
